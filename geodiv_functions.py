@@ -3,6 +3,7 @@
 # Author: Mark Lindsay https://orcid.org/0000-0003-2614-2069
 
 from scipy.ndimage import convolve
+from scipy.signal import fftconvolve
 import numpy as np
 import pandas as pd
 from scipy.stats import skew
@@ -13,28 +14,126 @@ import seaborn as sns
 import numpy as np
 from scipy.stats import f
 import plotly.graph_objects as go
+from adjustText import adjust_text
 
 
-
+# Moran's I is a measure of spatial autocorrelation, quantifying how similar values are to their neighbors in a spatial dataset. 
+# It ranges from -1 (perfect dispersion) to +1 (perfect clustering), with 0 indicating randomness.
+# In the context of 3D geodiversity models, Moran's I can help identify whether high or low density values are spatially
+# clustered, dispersed, or randomly distributed within the subsurface volume. 
+# This insight helps understand geophysical and geological structure.
 
 # define function to calculate Moran's I for 3D data
 
+# refer to https://en.wikipedia.org/wiki/Spatial_weight_matrix#/media/File:Chess_connectivity.svg for different neighborhood types
 
-def calculate_morans_i_3d(model_3d):
+def get_neighborhood_kernels():
+    """Returns a dictionary of kernels for different neighborhood scales."""
+    # 6-node (Rook)
+    k6 = np.zeros((3, 3, 3))
+    k6[1,1,0] = k6[1,1,2] = k6[1,0,1] = k6[1,2,1] = k6[0,1,1] = k6[2,1,1] = 1
+    
+    # 18-node (Face + Edge)
+    k18 = np.ones((3, 3, 3))
+    # Remove the 8 corners of the 3x3x3 cube
+    for i in [0, 2]:
+        for j in [0, 2]:
+            for k in [0, 2]:
+                k18[i, j, k] = 0
+    k18[1, 1, 1] = 0 # Remove center
+    
+    # 26-node (Queen)
+    k26 = np.ones((3, 3, 3))
+    k26[1, 1, 1] = 0
+    
+    # 2-ring (5x5x5 cube)
+    k124 = np.ones((5, 5, 5))
+    k124[2, 2, 2] = 0
+    
+    return {
+        "moran_6": k6,
+        "moran_18": k18,
+        "moran_26": k26,
+        "moran_2ring": k124
+    }
+
+# this function calculates Moran's I for a given 3D model and a specified neighborhood kernel. It uses FFT-based convolution for efficiency, especially with larger kernels.
+def calculate_moran_i(model_3d, kernel):
+    z = model_3d - np.mean(model_3d)
+    
+    # FFT convolution is O(N log N), much faster for the 5x5x5 kernel
+    z_lag = fftconvolve(z, kernel, mode='same')
+    
+    N = model_3d.size
+    # S0 is the sum of all weights in the connectivity matrix
+    # On a grid, this is roughly (N * sum of kernel) minus edge effects
+    # We calculate it precisely by convolving a matrix of ones
+    s0_matrix = fftconvolve(np.ones_like(z), kernel, mode='same')
+    S0 = np.sum(s0_matrix)
+    
+    numerator = N * np.sum(z * z_lag)
+    denominator = S0 * np.sum(z**2)
+    
+    return numerator / denominator
+
+# This function allows users to extract Moran's I values for multiple neighborhood selections in a flexible way. It can handle "all" kernels, a single kernel, or a list of kernels, and returns a dictionary of results.
+# This function is called within the main metric extraction function to compute Moran's I for each model in the ensemble based on the user's choice of neighborhood analysis.
+def extract_morans_i(model_3d, neighborhood_selection="all"):
+    """
+    neighborhood_selection: "all", a single string (e.g., "moran_26"), 
+                             or a list (e.g., ["moran_6", "moran_2ring"])
+    """
+    all_kernels = get_neighborhood_kernels()
+    results = {}
+    
+    # Fine which kernels to run
+    if neighborhood_selection == "all":
+        to_run = all_kernels.keys()
+    elif isinstance(neighborhood_selection, list):
+        to_run = [k for k in neighborhood_selection if k in all_kernels]
+    elif neighborhood_selection in all_kernels:
+        to_run = [neighborhood_selection]
+    else:
+        raise ValueError(f"Selection {neighborhood_selection} not recognized.")
+    
+    # Calculate chosen metrics
+    for name in to_run:
+        results[name] = calculate_moran_i(model_3d, all_kernels[name])
+        
+    return results
+
+# Below is an older version of the Moran's I function using spatial convolution. Fast for small models, but for larger models
+# and larger kernels, the FFT-based convolution is much faster. The above function is more flexible and can handle any kernel size.
+
+def calculate_morans_i_3d(model_3d, kernel=6):
     """
     model_3d: 3D numpy array (x, y, z) representing density
     """
     # 1. Mean-center the density values
     z = model_3d - np.mean(model_3d)
     
+    if kernel == 6:
     # 2. Define the neighborhood kernel (6-neighbor Rook contiguity)
     # This kernel sums the values of the 6 immediate face-sharing neighbors
-    kernel = np.array([
-        [[0, 0, 0], [0, 1, 0], [0, 0, 0]],
-        [[0, 1, 0], [1, 0, 1], [0, 1, 0]],
-        [[0, 0, 0], [0, 1, 0], [0, 0, 0]]
-    ])
-    
+        kernel = np.array([
+            [[0, 0, 0], [0, 1, 0], [0, 0, 0]],
+            [[0, 1, 0], [1, 0, 1], [0, 1, 0]],
+            [[0, 0, 0], [0, 1, 0], [0, 0, 0]]
+        ])
+    elif kernel == 18:
+        kernel = np.array([
+                [[0, 1, 0], [1, 1, 1], [0, 1, 0]],
+                [[1, 1, 1], [1, 0, 1], [1, 1, 1]],
+                [[0, 1, 0], [1, 1, 1], [0, 1, 0]]
+        ])
+        
+    elif kernel == 26:
+        kernel = np.array([
+                [[1, 1, 1], [1, 1, 1], [1, 1, 1]],
+                [[1, 1, 1], [1, 0, 1], [1, 1, 1]],
+                [[1, 1, 1], [1, 1, 1], [1, 1, 1]]
+        ])
+         
     # 3. Calculate Spatial Lag using convolution
     # lag_i = sum of neighbors' z-values
     z_lag = convolve(z, kernel, mode='constant', cval=0.0)
@@ -49,8 +148,10 @@ def calculate_morans_i_3d(model_3d):
     return numerator / denominator
 
 # define function to extract metrics from 4D ensemble tensor
+# neighborhood_selection defines Moran's I analysis:
+# can be "all", a single string (e.g., "moran_26"), or a list (e.g., ["moran_6", "moran_2ring"])
 
-def extract_metrics_4d(ensemble):
+def extract_metrics_4d(ensemble, neighborhood_selection="all"):
     """
     ensemble: np.array of shape (n_models, x_dim, y_dim, z_dim)
     Values are density.
@@ -97,9 +198,10 @@ def extract_metrics_4d(ensemble):
         evals = np.sort(evals)[::-1]
         
         # Moran's I for spatial autocorrelation
-        morans_i = calculate_morans_i_3d(rho)
+        morans_i = extract_morans_i(rho, neighborhood_selection=neighborhood_selection)
 
-        metrics_list.append({
+        # Create base metrics dictionary
+        metrics_dict = {
             'model_index': i,
             'mean_rho': m_rho,
             'var_rho': v_rho,
@@ -109,8 +211,13 @@ def extract_metrics_4d(ensemble):
             'sphericity': evals[2] / evals[0] if evals[0] > 0 else 0,
             'max_rho': np.max(rho),
             'min_rho': np.min(rho),
-            'morans_i': morans_i
-        })
+        }
+        
+        # Add each Moran's I as individual columns
+        for neighborhood_name, morans_value in morans_i.items():
+            metrics_dict[neighborhood_name] = morans_value
+        
+        metrics_list.append(metrics_dict)
 
     return pd.DataFrame(metrics_list).set_index('model_index')
 
@@ -187,6 +294,7 @@ def plot_pca_results(pca, scores, feature_names):
     plt.ylabel(f'PC2 ({exp_var[1]:.1%} variance)')
     plt.title('PCA Biplot: Models (Dots) vs. Metrics (Vectors)')
     plt.grid(True, linestyle=':', alpha=0.5)
+    adjust_text(plt.gca().texts, arrowprops=dict(arrowstyle='->', color='red'))
     plt.show()
 
 
