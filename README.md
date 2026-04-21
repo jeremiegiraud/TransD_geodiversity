@@ -1,5 +1,6 @@
 # TransD_geodiversity
 Geodiversity analysis of TransD geophysical inversion model ensembles
+
 Author: Mark Lindsay https://orcid.org/0000-0003-2614-2069
 
 This workflow is designed to analyse model emsembles. The methods are designed to:
